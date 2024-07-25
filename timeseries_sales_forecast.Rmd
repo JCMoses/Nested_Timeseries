@@ -1,0 +1,623 @@
+---
+title: "Time Series Sales Forecast"
+author: "J Moses"
+date: "2024-07-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Libraries ----
+library(modeltime)
+library(tidymodels)
+library(timetk)
+library(tidyverse)
+library(lubridate)
+library(xgboost)
+library(parsnip)
+library(dplyr)
+library(modeltime.ensemble)
+```
+
+## Business Case
+This project required the forecasting of sales amounts for 7 different ids, for the next 90 days.
+This is to allow for the business to plan inventory and expected sales.
+
+
+The data is provided as weekly time series data.
+As such, investigation or features for smaller time frames are not relevant.
+
+```{r, echo=FALSE, out.width="100%"}
+data_tbl <- walmart_sales_weekly
+
+data_tbl %>%
+    group_by(id) %>%
+    plot_time_series(
+        .date_var = Date, 
+        .value = Weekly_Sales, 
+        .facet_ncol = 2,
+        .smooth      = F,
+        .interactive = F
+        )
+```
+<br>
+Each time series is identified by a unique id: 1_1, 1_3, 1_8, 1_13, 1_38, 1_93, and 1_95.
+All time series' begin on February 5, 2010 and end on October 26, 2012. As such, each time series is 143 weeks.
+
+
+## Time Series Decomposition
+Time series data can be decomposed into it's components of trend, seasonality, and noise.
+
+
+```{r, echo=FALSE, out.width="100%"}
+data_tbl %>% 
+    group_by(id) %>%
+    plot_stl_diagnostics(.date_var = Date, .value = Weekly_Sales)
+```
+The frequency observed is 13 observations per quarter, with the trend having 52 observations per year. This is consistent with our previous manual observation of the data.
+
+## Nesting of the Time Series
+In order to apply the analysis to each of the time series simultaneously, the data is nested and grouped by id.
+A future length of 90 days has been included, to allow for the required prediction, as per the business case above.
+The time series' are also split into training and testing sets to allow for proper model validation.
+
+```{r}
+nested_data_tbl <- data_tbl %>%
+    group_by(id) %>%
+    extend_timeseries(    # adds in future timestamps, where the data will be missing
+        .id_var = id,
+        .date_var = Date,
+        .length_future = 90
+    ) %>%
+    nest_timeseries(      # adds nested dataframe, value and date as actual and future
+        .id_var = id,
+        .length_future = 90
+    ) %>%
+    split_nested_timeseries(     # creates train and test splits on actual data
+        .length_test = 90   # 90 days is the length of the test data set
+    )
+```
+
+## Modelling
+The method adopted is to use many different models, with different parameters. This will allow the best models for each individual time series to be selected. It will also, at a later stage, allow for the creation of ensembles of models.
+
+All told, 8 different algorithms are to be used. Some algorithms will have multiple versions with different parameters to allow for better models to be found for each of the individual series. It is not possible in advance to know which algorithms will be better suited for which time series (or which combination).
+The algorithms used include:
+    - ARIMA
+    - ARIMA boosted
+    - ETS (Exponential Smoothing)
+    - Prophet
+    - Linear Models
+    - MARS (Multivariate Adaptive Regression Spline)
+    - XGBoost
+    - GLM (Generalised Linear Models)
+            
+Some algorithms are able to use additional variables / features to model the data. Where this is possible, these features have been created. All features have been converted to a format that works for the individual algorithm.
+
+### ARIMA
+An Auto ARIMA model is created
+```{r}
+model_fit_arima <- arima_reg(seasonal_period = 52) %>%
+    set_engine("auto_arima") %>%
+    fit(Weekly_Sales ~ Date, extract_nested_train_split(nested_data_tbl))
+
+#model_fit_arima
+```
+
+### Boosted ARIMA
+3 Boosted ARIMA models are created, with different learning rates
+```{r}
+model_fit_arima_boosted_1 <- arima_boost(
+    seasonal_period = 52,
+    min_n = 2,
+    learn_rate = 0.0015
+) %>%
+    set_engine(engine = "auto_arima_xgboost") %>%
+    fit(Weekly_Sales ~ Date + as.numeric(Date) + factor(months(Date)),
+        data = extract_nested_train_split(nested_data_tbl))
+
+
+#model_fit_arima_boosted_1
+
+# boosted arima 2 ----
+model_fit_arima_boosted_2 <- arima_boost(
+    seasonal_period = 52,
+    min_n = 2,
+    learn_rate = 0.015
+) %>%
+    set_engine(engine = "auto_arima_xgboost") %>%
+    fit(Weekly_Sales ~ Date + as.numeric(Date) + factor(months(Date)),
+        data = extract_nested_train_split(nested_data_tbl))
+
+
+#model_fit_arima_boosted_2
+
+# boosted arima 3 ----
+model_fit_arima_boosted_3 <- arima_boost(
+    seasonal_period = 52,
+    min_n = 2,
+    learn_rate = 0.150
+) %>%
+    set_engine(engine = "auto_arima_xgboost") %>%
+    fit(Weekly_Sales ~ Date + as.numeric(Date) + factor(months(Date)),
+        data = extract_nested_train_split(nested_data_tbl))
+
+
+#model_fit_arima_boosted_3
+
+```
+### ETS
+An ETS model is created
+```{r}
+model_fit_ets <- exp_smoothing() %>%
+    set_engine(engine = "ets") %>%
+    fit(Weekly_Sales ~ Date, data = extract_nested_train_split(nested_data_tbl))
+```
+### Prophet
+A Prophet model is created
+```{r}
+model_fit_prophet <- prophet_reg(
+    seasonality_yearly = TRUE
+) %>%
+    set_engine(engine = "prophet") %>%
+    fit(Weekly_Sales ~ Date, data = extract_nested_train_split(nested_data_tbl))
+```
+### LM Model
+A Linear Model is created
+```{r}
+model_fit_lm <- linear_reg() %>%
+    set_engine("lm") %>%
+    fit(Weekly_Sales ~ as.numeric(Date) + factor(months(Date), ordered = FALSE),
+        data = extract_nested_train_split(nested_data_tbl))
+```
+
+### MARS
+A Multivariate Adaptive Regression Spline model is created.
+For this model, additional date features are created which may help improve the performance of the model.
+```{r}
+model_spec_mars <- mars(mode = "regression") %>%
+    set_engine("earth") 
+
+recipe_spec_mars <- recipe(Weekly_Sales ~ Date, data = extract_nested_train_split(nested_data_tbl)) %>%
+    step_date(Date, features = "month", ordinal = FALSE) %>%
+    step_mutate(date_num = as.numeric(Date)) %>%
+    step_normalize(date_num) %>%
+    step_rm(Date)
+
+wflw_fit_mars <- workflow() %>%
+    add_recipe(recipe_spec_mars) %>%
+    add_model(model_spec_mars) %>%
+    fit(extract_nested_train_split(nested_data_tbl))
+```
+### XGBoost
+4 XGBoost models are created. Each uses a different learn rate in order to allow for better models to be present for different time series.
+Date features are also added to these models in order to create better models. The variables are transformed into a format that works for the algorithm.
+```{r}
+rec_xgb <- recipe(Weekly_Sales ~ ., extract_nested_train_split(nested_data_tbl)) %>%
+    step_timeseries_signature(Date) %>%    # creates calenader features
+    step_rm(Date) %>%                      # removes date feature for xgboost
+    step_zv(all_predictors()) %>%           # removes zero variance predictors
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%   # dummy any nominal predictors
+    step_integer(all_logical_predictors())
+
+wflw_fit_xgb_1 <- workflow() %>%
+    add_model(boost_tree("regression", learn_rate = 0.50) %>% set_engine("xgboost")) %>%
+    add_recipe(rec_xgb)
+
+wflw_fit_xgb_2 <- workflow() %>%
+    add_model(boost_tree("regression", learn_rate = 0.35) %>% set_engine("xgboost")) %>%
+    add_recipe(rec_xgb)
+
+wflw_fit_xgb_3 <- workflow() %>%
+    add_model(boost_tree("regression", learn_rate = 0.15) %>% set_engine("xgboost")) %>%
+    add_recipe(rec_xgb)
+
+wflw_fit_xgb_4 <- workflow() %>%
+    add_model(boost_tree("regression", learn_rate = 0.05) %>% set_engine("xgboost")) %>%
+    add_recipe(rec_xgb)
+
+```
+
+### GLM
+3 Generalised Linear Models have been created. The penalty has been adjusted for each model to improve the likelihood that a good model can be found for different time series.
+```{r}
+model_fit_glmnet_1 <- linear_reg(penalty = 0.01) %>%
+    set_engine("glmnet") %>%
+    fit(
+        Weekly_Sales ~ as.numeric(Date) 
+        + factor(months(Date), ordered = FALSE),
+        extract_nested_train_split(nested_data_tbl)
+    )
+
+
+
+
+# GLM 2
+model_fit_glmnet_2 <- linear_reg(penalty = 0.05) %>%
+    set_engine("glmnet") %>%
+    fit(
+        Weekly_Sales ~ as.numeric(Date) 
+        + factor(months(Date), ordered = FALSE),
+        extract_nested_train_split(nested_data_tbl)
+    )
+
+
+
+# GLM 3
+model_fit_glmnet_3 <- linear_reg(penalty = 0.1) %>%
+    set_engine("glmnet") %>%
+    fit(
+        Weekly_Sales ~ as.numeric(Date) 
+        + factor(months(Date), ordered = FALSE),
+        extract_nested_train_split(nested_data_tbl)
+    )
+
+
+
+```
+## Fitting the Models
+This section uses parallel processing so that modelling can be undertaken in parallel (at the same time).
+The machine used has 24 cores - as such parallel processing utilises all of these.
+
+The models are then fitted to the training set here.
+
+```{r}
+parallel_start(24)  # for 24 clusters (i.e. cores)
+
+nested_modeltime_tbl <- nested_data_tbl %>%
+    
+    modeltime_nested_fit(
+        
+        model_list = list(
+            model_fit_arima,
+            model_fit_arima_boosted_1,
+            model_fit_arima_boosted_2,
+            model_fit_arima_boosted_3,
+            model_fit_ets,
+            model_fit_prophet,
+            model_fit_lm,
+            wflw_fit_mars,
+            wflw_fit_xgb_1,
+            wflw_fit_xgb_2,
+            wflw_fit_xgb_3,
+            wflw_fit_xgb_4,
+            model_fit_glmnet_1,
+            model_fit_glmnet_2,
+            model_fit_glmnet_3
+            
+        ),
+        control = control_nested_fit(
+            verbose = FALSE,
+            allow_par = TRUE
+        )
+    )
+
+
+nested_modeltime_tbl
+```
+
+## Check the Accuracy of each Model
+
+```{r, out.width="100%"}
+nested_modeltime_tbl %>%
+    extract_nested_test_accuracy() %>%
+    table_modeltime_accuracy()
+```
+The various error measurements can be used to select for each time series id, which models might be useful in an Ensemble of models
+
+## Ensembles
+By examining which models are most accurate for each of the time series, the best models are selected for each, and Ensembles of these models are created.
+3 different kinds of ensembles are created: Mean of the component models, Median of the component models, and a weighted average of the component models. The weights are chosen based on the relative accuracy of each model included.
+
+### Time Series 1_1: mean and median ensembles
+```{r}
+ensem <- nested_modeltime_tbl %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(4, 5, 8, 9, 10), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem %>% extract_nested_modeltime_table()
+
+ensem_2 <- ensem %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(4, 5, 8, 9, 10), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_2 %>% extract_nested_modeltime_table()
+```
+### Time Series 1_3: mean and median ensembles
+```{r}
+ensem_3 <- ensem_2 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(3, 4, 5, 6, 7, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_3 %>% extract_nested_modeltime_table()
+
+ensem_4 <- ensem_3 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(3, 4, 5, 6, 7, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_4 %>% extract_nested_modeltime_table()
+
+```
+### Time Series 1_8: mean and median ensembles
+```{r}
+ensem_5 <- ensem_4 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_5 %>% extract_nested_modeltime_table()
+
+ensem_6 <- ensem_5 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_6 %>% extract_nested_modeltime_table()
+
+```
+### Time Series 1_13: mean and median ensembles
+```{r}
+ensem_7 <- ensem_6 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 2, 3, 4, 9, 10), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_7 %>% extract_nested_modeltime_table()
+
+ensem_8 <- ensem_7 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 2, 3, 4, 9, 10), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### Time Series 1_38: mean and median ensembles
+```{r}
+ensem_9 <- ensem_8 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 9, 10, 11), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_9 %>% extract_nested_modeltime_table()
+
+ensem_10 <- ensem_9 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(1, 9, 10, 11), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+
+#ensem_10 %>% extract_nested_modeltime_table()
+```
+### Time Series 1_93: mean and median ensembles
+```{r}
+ensem_11 <- ensem_10 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(2, 3, 6, 7, 9, 10, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_11 %>% extract_nested_modeltime_table()
+
+ensem_12 <- ensem_11 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(2, 3, 6, 7, 9, 10, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_12 %>% extract_nested_modeltime_table()
+
+```
+### Time Series 1_95: mean and median ensembles
+```{r}
+ensem_13 <- ensem_12 %>%
+    ensemble_nested_average(
+        type           = "mean",
+        keep_submodels = TRUE,
+        model_ids      = c(6, 7, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_13 %>% extract_nested_modeltime_table()
+
+ensem_14 <- ensem_13 %>%
+    ensemble_nested_average(
+        type           = "median",
+        keep_submodels = TRUE,
+        model_ids      = c(6, 7, 13, 14, 15), # select the "best" models
+        control        = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+
+#ensem_14 %>% extract_nested_modeltime_table()
+```
+## Weighted Ensembles
+
+### 1_1
+```{r}
+model_ids <- c(4, 5, 8, 9, 10)
+
+ensem_15 <- ensem_14 %>%
+    ensemble_nested_weighted(
+        loadings = c(4, 1, 3, 1, 1), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### 1_3
+```{r}
+model_ids <- c(3, 4, 5, 6, 7, 13, 14, 15)
+
+ensem_16 <- ensem_15 %>%
+    ensemble_nested_weighted(
+        loadings = c(1, 2, 1, 1, 3, 3, 3, 3), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### 1_8
+```{r}
+model_ids <- c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 14, 15)
+
+ensem_17 <- ensem_16 %>%
+    ensemble_nested_weighted(
+        loadings = c(2, 2, 2, 2, 2, 1, 3, 1, 1, 1, 3, 3, 3), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### 1_13
+```{r}
+model_ids <- c(1, 2, 3, 4, 9, 10)
+
+ensem_18 <- ensem_17 %>%
+    ensemble_nested_weighted(
+        loadings = c(2, 2, 2, 2, 1, 1), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+
+### 1_38
+```{r}
+model_ids <- c(1, 9, 10, 11)
+
+ensem_19 <- ensem_18 %>%
+    ensemble_nested_weighted(
+        loadings = c(1, 3, 3, 2), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### 1_93
+```{r}
+model_ids <- c(2, 3, 6, 7, 9, 10, 13, 14, 15)
+
+ensem_20 <- ensem_19 %>%
+    ensemble_nested_weighted(
+        loadings = c(1, 1, 2, 1, 1, 3, 1, 1, 1), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+### 1_95
+```{r}
+model_ids <- c(4, 5, 96, 7, 13, 14, 15)
+
+ensem_21 <- ensem_20 %>%
+    ensemble_nested_weighted(
+        loadings = c(1, 2, 1, 1, 1), # determine from mae of the chosen models
+        scale_loadings = TRUE,
+        metric = "rmse",
+        keep_submodels = TRUE,
+        model_ids = model_ids,
+        control = control_nested_fit(allow_par = TRUE, verbose = FALSE)
+    )
+```
+## Review Accuracy
+Includes all ensembles used. The accuracy is shown for each time series by each model.
+
+```{r, out.width="100%"}
+ensem_21 %>%
+    extract_nested_test_accuracy() %>%
+    table_modeltime_accuracy()
+```
+## Select the Best model / ensemble for each time series
+rmse: root mean squared error was chosen as the metric to select the best model
+```{r}
+nested_best_tbl <- ensem_21 %>% 
+    modeltime_nested_select_best(metric = "rmse")
+```
+
+## Visualise the best models for each time series
+The plot below shows the best performing model for each time series.
+```{r, out.width="100%"}
+nested_best_tbl %>%
+    extract_nested_test_forecast() %>%
+    group_by(id) %>%
+    plot_modeltime_forecast(.facet_ncol = 3)
+
+```
+
+## Refit the Models
+This is done for the whole dataset to give a good prediction for the next 90 days.
+```{r}
+nested_best_refit_tbl <- nested_best_tbl %>%
+    modeltime_nested_refit(
+        control = control_refit(
+            verbose = FALSE,
+            allow_par = TRUE
+        )
+    )
+
+# Save refitted model
+# nested_best_refit_tbl %>% write_rds("nested_best_refit_tbl.rds")
+
+```
+## Visualise future Forecasts 
+Done for each time series - Greyed areas are the margin for error
+```{r, out.width="100%"}
+nested_best_refit_tbl %>%
+    extract_nested_future_forecast() %>%
+    group_by(id) %>%
+    plot_modeltime_forecast(.facet_ncol = 3)
+
+```
+Stop parallel processing
+```{r}
+parallel_stop()
+```
+
